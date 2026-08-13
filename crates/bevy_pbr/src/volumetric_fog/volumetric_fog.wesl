@@ -211,9 +211,11 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     //
     // [2]: https://en.wikipedia.org/wiki/Beer%E2%80%93Lambert_law
 
-    // Use Beer's law again to accumulate the ambient light all along the path.
-    var accumulated_color = exp(-ray_length_view * (absorption + scattering)) * ambient_color *
-        ambient_intensity;
+    // Ambient/skylight in-scatter is integrated per-step further below. The
+    // previous closed-form term `exp(-ray_length_view * (absorption +
+    // scattering)) * ambient` ignored density entirely and underflows to zero
+    // for world-scale volumes.
+    var accumulated_color = vec3(0.0);
 
     // This is the amount of the background that shows through. We're actually
     // going to recompute this over and over again for each directional light,
@@ -226,6 +228,32 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     @if(DENSITY_TEXTURE)
     let Rd_step_uvw = mat3x3(uvw_from_world[0].xyz, uvw_from_world[1].xyz, uvw_from_world[2].xyz) *
         (Rd_world * step_size_world);
+
+    // Integrate unshadowed ambient/skylight in-scatter along the path:
+    // isotropic, density-aware, independent of any light's shadow maps. This
+    // is a dedicated raymarch, separate from the light loops below, which
+    // duplicates their per-step density/transmittance work rather than
+    // reusing it (kept naive/unoptimized intentionally, for comparison).
+    if (ambient_intensity > 0.0) {
+        var ambient_background_alpha = 1.0;
+        for (var step = 0u; step < step_count; step += 1u) {
+            if (ambient_background_alpha < 0.001) {
+                break;
+            }
+            var density = density_factor;
+            @if(DENSITY_TEXTURE)
+            let P_uvw = Ro_uvw + Rd_step_uvw * f32(step);
+            @if(DENSITY_TEXTURE)
+            if (all(P_uvw >= vec3(0.0)) && all(P_uvw <= vec3(1.0))) {
+                density *= textureSampleLevel(density_texture, density_sampler, P_uvw + density_texture_offset, 0.0).r;
+            } else {
+                density = 0.0;
+            }
+            accumulated_color += ambient_color * ambient_intensity * fog_color * scattering *
+                density * step_size_world * ambient_background_alpha;
+            ambient_background_alpha *= exp(-step_size_world * density * (absorption + scattering));
+        }
+    }
 
     for (var light_index = 0u; light_index < directional_light_count; light_index += 1u) {
         // Volumetric lights are all sorted first, so the first time we come to
